@@ -1,0 +1,219 @@
+name: Build PS3 Claude
+
+on:
+  workflow_dispatch:
+    inputs:
+      proxy_ip:
+        description: "IP do celular na rede (ex: 192.168.0.15)"
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ps3dev/ps3dev:latest
+    steps:
+      - name: Gerar arquivos e compilar
+        env:
+          PROXY_IP: ${{ inputs.proxy_ip }}
+        run: |
+          set -e
+          export PS3DEV=${PS3DEV:-/usr/local/ps3dev}
+          export PSL1GHT=${PSL1GHT:-$PS3DEV/psl1ght}
+          export PATH=$PATH:$PS3DEV/bin:$PS3DEV/ppu/bin:$PSL1GHT/bin
+          echo "PS3DEV=$PS3DEV PSL1GHT=$PSL1GHT"
+
+          mkdir -p work/pkg/USRDIR
+          cd work
+
+          # ---------- ICONE ----------
+          python3 - <<'PY'
+          import zlib, struct
+          w, h = 320, 176
+          raw = b''.join(b'\x00' + bytes([30, 60, 140]) * w for _ in range(h))
+          def ch(t, d):
+              c = struct.pack('>I', len(d)) + t + d
+              return c + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+          png = (b'\x89PNG\r\n\x1a\n'
+                 + ch(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+                 + ch(b'IDAT', zlib.compress(raw))
+                 + ch(b'IEND', b''))
+          open('pkg/ICON0.PNG', 'wb').write(png)
+          PY
+
+          # ---------- CODIGO ----------
+          cat > main.c <<'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <malloc.h>
+          #include <ppu-types.h>
+          #include <sys/process.h>
+          #include <sysutil/sysutil.h>
+          #include <sysutil/msg.h>
+          #include <sysutil/video.h>
+          #include <rsx/rsx.h>
+          #include <net/net.h>
+          #include <sys/socket.h>
+          #include <netinet/in.h>
+          #include <arpa/inet.h>
+
+          #ifndef PROXY_IP
+          #define PROXY_IP "192.168.0.15"
+          #endif
+          #define PROXY_PORT 8080
+
+          #define CB_SIZE   0x100000
+          #define HOST_SIZE (32 * 1024 * 1024)
+
+          static gcmContextData *context;
+          static u32 *fb[2];
+          static u32 fb_off[2];
+          static u32 cur = 0;
+          static u16 W, H;
+          static int first_flip = 1;
+          static volatile int running = 1;
+          static volatile int dialog_done = 0;
+
+          static void init_screen(void) {
+              void *host = memalign(1024 * 1024, HOST_SIZE);
+              rsxInit(&context, CB_SIZE, HOST_SIZE, host);
+
+              videoState state;
+              videoGetState(0, 0, &state);
+              videoResolution res;
+              videoGetResolution(state.displayMode.resolution, &res);
+
+              videoConfiguration vc;
+              memset(&vc, 0, sizeof(vc));
+              vc.resolution = state.displayMode.resolution;
+              vc.format = VIDEO_BUFFER_FORMAT_XRGB;
+              vc.pitch = res.width * sizeof(u32);
+              videoConfigure(0, &vc, NULL, 0);
+              gcmSetFlipMode(GCM_FLIP_VSYNC);
+
+              W = res.width;
+              H = res.height;
+              for (int i = 0; i < 2; i++) {
+                  fb[i] = (u32 *)rsxMemalign(64, H * vc.pitch);
+                  rsxAddressToOffset(fb[i], &fb_off[i]);
+                  gcmSetDisplayBuffer(i, fb_off[i], vc.pitch, W, H);
+              }
+              gcmResetFlipStatus();
+          }
+
+          static void flip(void) {
+              for (u32 i = 0; i < (u32)W * H; i++) fb[cur][i] = 0x00102040;
+              if (!first_flip) {
+                  while (gcmGetFlipStatus() != 0) usleep(200);
+              }
+              first_flip = 0;
+              gcmResetFlipStatus();
+              gcmSetFlip(context, cur);
+              rsxFlushBuffer(context);
+              gcmSetWaitFlip(context);
+              cur ^= 1;
+          }
+
+          static void sys_cb(u64 status, u64 param, void *ud) {
+              if (status == SYSUTIL_EXIT_GAME) running = 0;
+          }
+
+          static void dialog_cb(msgButton button, void *ud) {
+              dialog_done = 1;
+          }
+
+          static void show(const char *text) {
+              dialog_done = 0;
+              msgDialogOpen2((msgType)(MSG_DIALOG_NORMAL | MSG_DIALOG_BTN_TYPE_OK),
+                             text, dialog_cb, NULL, NULL);
+              while (running && !dialog_done) {
+                  sysUtilCheckCallback();
+                  flip();
+              }
+          }
+
+          /* GET simples em HTTP puro para o proxy */
+          static int http_get(const char *path, char *out, int outsz) {
+              int s = socket(AF_INET, SOCK_STREAM, 0);
+              if (s < 0) return -1;
+              struct sockaddr_in a;
+              memset(&a, 0, sizeof(a));
+              a.sin_family = AF_INET;
+              a.sin_port = htons(PROXY_PORT);
+              a.sin_addr.s_addr = inet_addr(PROXY_IP);
+              if (connect(s, (struct sockaddr *)&a, sizeof(a)) < 0) {
+                  close(s);
+                  return -2;
+              }
+              char req[512];
+              snprintf(req, sizeof(req),
+                       "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
+                       path, PROXY_IP);
+              send(s, req, strlen(req), 0);
+
+              static char raw[4096];
+              int n = 0, r;
+              while (n < (int)sizeof(raw) - 1 &&
+                     (r = recv(s, raw + n, sizeof(raw) - 1 - n, 0)) > 0)
+                  n += r;
+              raw[n] = 0;
+              close(s);
+
+              char *body = strstr(raw, "\r\n\r\n");
+              body = body ? body + 4 : raw;
+              strncpy(out, body, outsz - 1);
+              out[outsz - 1] = 0;
+              return 0;
+          }
+
+          int main(void) {
+              init_screen();
+              sysUtilRegisterCallback(SYSUTIL_EVENT_SLOT0, sys_cb, NULL);
+              netInitialize();
+              flip();
+
+              static char answer[600];
+              int rc = http_get("/chat?q=oi%20tudo%20bem", answer, 400);
+              if (rc != 0) {
+                  snprintf(answer, sizeof(answer),
+                           "Nao consegui falar com o proxy (%d). "
+                           "Confira o IP %s e se o Termux esta rodando.",
+                           rc, PROXY_IP);
+              }
+              show(answer);
+
+              netDeinitialize();
+              return 0;
+          }
+          EOF
+
+          # ---------- COMPILAR ----------
+          APPID=CLAUDE001
+          CONTENTID=UP0001-${APPID}_00-0000000000000000
+
+          ppu-gcc -O2 -Wall -mcpu=cell \
+            -DPROXY_IP="\"$PROXY_IP\"" \
+            -I$PSL1GHT/ppu/include -I$PS3DEV/portlibs/ppu/include \
+            main.c -o app.elf \
+            -L$PSL1GHT/ppu/lib \
+            -lnet -lrsx -lgcm_sys -lio -lsysutil -lsysmodule -lrt -llv2
+
+          ppu-strip app.elf -o app_stripped.elf
+          sprxlinker app_stripped.elf
+          make_self_npdrm app_stripped.elf pkg/USRDIR/EBOOT.BIN $CONTENTID
+          python3 $PSL1GHT/bin/sfo.py --title "PS3 Claude" --appid "$APPID" \
+            -f $PSL1GHT/bin/sfo.xml pkg/PARAM.SFO || \
+            sfo.py --title "PS3 Claude" --appid "$APPID" \
+            -f $PSL1GHT/bin/sfo.xml pkg/PARAM.SFO
+          python3 $PSL1GHT/bin/pkg.py --contentid $CONTENTID pkg/ ps3claude.pkg || \
+            pkg.py --contentid $CONTENTID pkg/ ps3claude.pkg
+          ls -la ps3claude.pkg
+
+      - name: Publicar o .pkg
+        uses: actions/upload-artifact@v4
+        with:
+          name: ps3claude-pkg
+          path: work/ps3claude.pkg
+          
