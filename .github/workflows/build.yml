@@ -11,7 +11,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: ps3dev/ps3dev:latest
+    container: ghcr.io/altps3/ps3dev:latest
     steps:
       - name: Gerar arquivos e compilar
         env:
@@ -20,6 +20,7 @@ jobs:
           set -e
           export PS3DEV=${PS3DEV:-/usr/local/ps3dev}
           export PSL1GHT=${PSL1GHT:-$PS3DEV/psl1ght}
+          [ -d "$PSL1GHT/ppu/include" ] || export PSL1GHT=$PS3DEV
           export PATH=$PATH:$PS3DEV/bin:$PS3DEV/ppu/bin:$PSL1GHT/bin
           echo "PS3DEV=$PS3DEV PSL1GHT=$PSL1GHT"
 
